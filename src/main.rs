@@ -443,9 +443,18 @@ fn run(opts: &Opts) -> io::Result<()> {
             // Adopt the user's current level for the eventual restore — this is
             // how a manual brightnessctl/Fn+F7 change while we're running is
             // picked up without polling the sysfs file.
-            if let Some(b) = led.read() {
+            let current = led.read();
+            if let Some(b) = current {
                 if b > 0 {
                     active_level = b;
+                } else {
+                    // Already dark — don't clobber state. This handles the case
+                    // where omarchy-brightness-keyboard off (lock blank) already
+                    // set 0, or user manually set 0. Matches PR 8134 logic:
+                    // only save-before-set when lit, otherwise just stay idle.
+                    eprintln!("idle: already off (restore level {active_level})");
+                    idle = true;
+                    continue;
                 }
             }
             if let Err(e) = led.write(0) {
