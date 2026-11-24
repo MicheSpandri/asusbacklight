@@ -43,6 +43,7 @@ struct Opts {
     idle: Duration,
     led_dir: PathBuf,
     input_dir: PathBuf,
+    enforce_idle: bool,
     verbose: bool,
 }
 
@@ -54,6 +55,7 @@ fn print_usage() {
          \n    --idle <secs>       idle seconds before dimming (default: {DEFAULT_IDLE_SECS})\
          \n    --led-dir <path>    LED brightness directory (default: {DEFAULT_LED_DIR})\
          \n    --input-dir <path>  input device directory (default: {DEFAULT_INPUT_DIR})\
+         \n    --enforce-idle      suppress external relighting while idle\
          \n    --verbose           log extra detail to stderr\
          \n    -h, --help          show this help"
     );
@@ -63,16 +65,16 @@ fn parse_args() -> Opts {
     let mut idle = DEFAULT_IDLE_SECS;
     let mut led_dir = PathBuf::from(DEFAULT_LED_DIR);
     let mut input_dir = PathBuf::from(DEFAULT_INPUT_DIR);
+    let mut enforce_idle = false;
     let mut verbose = false;
 
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
         let mut next_val = || {
-            args.next()
-                .unwrap_or_else(|| {
-                    eprintln!("missing value for {a}");
-                    std::process::exit(2);
-                })
+            args.next().unwrap_or_else(|| {
+                eprintln!("missing value for {a}");
+                std::process::exit(2);
+            })
         };
         match a.as_str() {
             "--idle" => {
@@ -83,6 +85,7 @@ fn parse_args() -> Opts {
             }
             "--led-dir" => led_dir = PathBuf::from(next_val()),
             "--input-dir" => input_dir = PathBuf::from(next_val()),
+            "--enforce-idle" => enforce_idle = true,
             "--verbose" => verbose = true,
             "-h" | "--help" => {
                 print_usage();
@@ -100,6 +103,7 @@ fn parse_args() -> Opts {
         idle: Duration::from_secs(idle.max(1)),
         led_dir,
         input_dir,
+        enforce_idle,
         verbose,
     }
 }
@@ -266,6 +270,24 @@ unsafe fn install_signal_handlers() {
 // Main loop
 // ---------------------------------------------------------------------------
 
+fn enforce_idle_relight(
+    led: &Led,
+    enforce_idle: bool,
+    idle: bool,
+    brightness_changed: bool,
+) -> io::Result<bool> {
+    if !enforce_idle || !idle || !brightness_changed {
+        return Ok(false);
+    }
+
+    if !matches!(led.read(), Some(level) if level > 0) {
+        return Ok(false);
+    }
+
+    led.write(0)?;
+    Ok(true)
+}
+
 fn run(opts: &Opts) -> io::Result<()> {
     // Watch /dev/input for hotplug events.
     let mut inotify = Inotify::init()?;
@@ -280,12 +302,24 @@ fn run(opts: &Opts) -> io::Result<()> {
     let led = Led {
         dir: opts.led_dir.clone(),
     };
+    let brightness_watch = if opts.enforce_idle {
+        Some(
+            inotify
+                .watches()
+                .add(led.dir.join("brightness"), WatchMask::MODIFY)?,
+        )
+    } else {
+        None
+    };
 
     // Sanity check up front: can we actually write the brightness file?
     // (Harmless no-op write of the current value.)
     if let Some(cur) = led.read() {
         if let Err(e) = led.write(cur) {
-            eprintln!("WARNING: cannot write {}: {e}", led.dir.join("brightness").display());
+            eprintln!(
+                "WARNING: cannot write {}: {e}",
+                led.dir.join("brightness").display()
+            );
             eprintln!("         run as root, or grant write access (see README.md).");
         }
     } else {
@@ -350,6 +384,7 @@ fn run(opts: &Opts) -> io::Result<()> {
         }
 
         if rc > 0 {
+            let mut brightness_changed = false;
             // --- hotplug notifications -------------------------------------
             if fds[0].revents & libc::POLLIN != 0 {
                 let mut buf = [0u8; 4096];
@@ -369,13 +404,20 @@ fn run(opts: &Opts) -> io::Result<()> {
                         Err(e) => return Err(e),
                     };
                     let mut got = 0usize;
-                    for _ in events {
+                    for event in events {
                         got += 1;
+                        if brightness_watch
+                            .as_ref()
+                            .is_some_and(|watch| watch == &event.wd)
+                        {
+                            brightness_changed = true;
+                        } else {
+                            rescan_pending = true;
+                        }
                     }
                     if got == 0 {
                         break;
                     }
-                    rescan_pending = true;
                 }
             }
 
@@ -435,6 +477,11 @@ fn run(opts: &Opts) -> io::Result<()> {
                 rescan(opts, &mut watches)?;
                 rescan_pending = false;
             }
+            match enforce_idle_relight(&led, opts.enforce_idle, idle, brightness_changed) {
+                Ok(true) => eprintln!("idle: external relight suppressed"),
+                Ok(false) => {}
+                Err(e) => eprintln!("failed to enforce idle brightness: {e}"),
+            }
         }
 
         // --- idle check -----------------------------------------------------
@@ -476,5 +523,46 @@ fn main() {
     if let Err(e) = run(&opts) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn enforce_idle_relight_only_when_needed() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "asus-backlight-test-{}-{unique}",
+            std::process::id()
+        ));
+
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("brightness"), "3\n").unwrap();
+        let led = Led { dir: dir.clone() };
+
+        // Disabled, active, or unchanged: brightness must remain 3.
+        for (enabled, idle, changed) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert!(!enforce_idle_relight(&led, enabled, idle, changed).unwrap());
+            assert_eq!(led.read(), Some(3));
+        }
+
+        // External relight while idle: brightness must become 0.
+        assert!(enforce_idle_relight(&led, true, true, true).unwrap());
+        assert_eq!(led.read(), Some(0));
+
+        // Already off: do not write again.
+        assert!(!enforce_idle_relight(&led, true, true, true).unwrap());
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -86,6 +86,7 @@ asus-backlight-idle [OPTIONS]
   --idle <secs>       idle seconds before dimming (default: 30)
   --led-dir <path>    LED brightness directory (default: /sys/class/leds/asus::kbd_backlight)
   --input-dir <path>  input device directory (default: /dev/input)  [testing]
+  --enforce-idle      suppress external relighting while idle
   --verbose           log extra detail to stderr
 ```
 
@@ -95,6 +96,25 @@ You normally don't run it by hand — the user service does. To try it once:
 pkill -f asus-backlight-idle
 /usr/local/bin/asus-backlight-idle --idle 15 --verbose
 ```
+
+### Prevent external relighting (optional)
+
+Some desktop environments, such as GNOME, may turn the keyboard
+backlight on again during power-management transitions, even
+when the user is still idle.
+
+Use `--enforce-idle` to keep the backlight off until the next
+keyboard or pointer input. The daemon watches the sysfs brightness
+file using inotify, without periodic polling.
+
+This option is disabled by default to preserve existing behaviour.
+
+When enabled, external brightness changes made while idle,
+including manual changes through `brightnessctl`, may be
+overridden. Changes made during normal activity are unaffected.
+
+Detection requires the brightness file to generate inotify
+events, which may depend on the hardware and driver.
 
 ### Pairing with ambientd
 
